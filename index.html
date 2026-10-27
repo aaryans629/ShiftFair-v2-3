@@ -38,6 +38,10 @@ const shiftCls=(p,id)=>{const w=p.shifts.filter(s=>s.hours>0);const i=w.findInde
 const initialRoster=p=>{const w=p.shifts.filter(s=>s.hours>0),r={};
  WORKERS.forEach((x,i)=>{r[x.id]={};DAYS.forEach((d,j)=>{
   r[x.id][d]=(i%2===0&&j<5)?w[0].id:(i%2===1&&j>=2)?w[1].id:'rest'})});return r};
+const DEMO_SWAPS=[
+ {id:'s1',req:'w1',tgt:'w3',day:'Wed',status:'pending'},
+ {id:'s2',req:'w4',tgt:'w2',day:'Fri',status:'pending'}
+];
 const gini=v=>{const n=v.length;if(!n)return 0;const s=[...v].sort((a,b)=>a-b),t=s.reduce((a,b)=>a+b,0);if(!t)return 0;
  return s.reduce((a,x,i)=>a+(2*(i+1)-n-1)*x,0)/(n*t)};
 const csvCell=v=>{let s=String(v);if(/^[=+\-@]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"'};
@@ -53,25 +57,65 @@ function App(){
  const [role,setRole]=useState('admin'),[tab,setTab]=useState('generator'),[pk,setPk]=useState('CONSTRUCTION');
  const P=PROFILES[pk];
  const [roster,setRoster]=useState(()=>initialRoster(PROFILES.CONSTRUCTION));
- const [swaps,setSwaps]=useState([
-  {id:'s1',req:'w1',tgt:'w3',day:'Wed',status:'pending'},{id:'s2',req:'w4',tgt:'w2',day:'Fri',status:'pending'}]);
+  const [swaps,setSwaps]=useState(()=>DEMO_SWAPS.map(s=>({...s})));
+  const [scheduleStatus,setScheduleStatus]=useState('loading'),[loadedProfile,setLoadedProfile]=useState('');
+  const [storageError,setStorageError]=useState('');
  const [weather,setWeather]=useState(false),[surge,setSurge]=useState(false);
  const [wt,setWt]=useState({overtime:45,rest:35,pref:20});
  const [running,setRunning]=useState(false),[step,setStep]=useState(0),[logs,setLogs]=useState([]);
- const timer=useRef(null),busy=useRef(false),mounted=useRef(false),toastTimers=useRef(new Set());
+  const timer=useRef(null),busy=useRef(false),toastTimers=useRef(new Set());
+  const loadGeneration=useRef(0),saveGeneration=useRef(0);
  const [wid,setWid]=useState('w1'),[toasts,setToasts]=useState([]);
  const [modal,setModal]=useState(false),[swDay,setSwDay]=useState('Mon'),[swTgt,setSwTgt]=useState('w2');
  const [vq,setVq]=useState(''),[vr,setVr]=useState('');
  const [cmp,setCmp]=useState(null);
  const cov=useMemo(()=>coverage(roster,P),[roster,P]);
+  const updateRoster=next=>{setRoster(current=>typeof next==='function'?next(current):next);
+   saveGeneration.current++;setScheduleStatus('dirty');setStorageError('')};
+  const updateSwaps=next=>{setSwaps(current=>typeof next==='function'?next(current):next);
+   saveGeneration.current++;setScheduleStatus('dirty');setStorageError('')};
  const loadUnfair=()=>{const w=P.shifts.filter(s=>s.hours>0),heavy=w[w.length-1].id,light=w[0].id,r={};
   WORKERS.forEach((x,i)=>{r[x.id]={};DAYS.forEach((d,j)=>{r[x.id][d]=i<3?heavy:(j<4?light:'rest')})});
-  setRoster(r);setCmp(null);toast('Loaded unfair demo roster — now click Generate','info')};
+   updateRoster(r);setCmp(null);toast('Loaded unfair demo roster — now click Generate','info')};
 
  const cap=P.cap-(pk==='CONSTRUCTION'&&weather?4:0);
  const maxC=Math.max(2,Math.min(MAX_CONSEC,Math.round(3+wt.rest/100*2))-(pk==='COLLEGE'&&surge?1:0));
 
- useEffect(()=>{if(!mounted.current){mounted.current=true;return}setRoster(initialRoster(PROFILES[pk]));setSwaps([]);setWeather(false);setSurge(false);setCmp(null)},[pk]);
+  useEffect(()=>{
+   const generation=++loadGeneration.current;
+   saveGeneration.current++;
+   setScheduleStatus('loading');setLoadedProfile('');setStorageError('');
+   setRoster(initialRoster(PROFILES[pk]));setSwaps(pk==='CONSTRUCTION'?DEMO_SWAPS.map(s=>({...s})):[]);
+   setWeather(false);setSurge(false);setCmp(null);
+   fetch('/api/state?profile='+encodeURIComponent(pk))
+    .then(res=>{if(!res.ok)throw new Error('Server returned '+res.status);return res.json()})
+    .then(data=>{if(generation!==loadGeneration.current)return;
+     setRoster(data.saved?data.roster:initialRoster(PROFILES[pk]));
+     setSwaps(data.saved?data.swaps:(pk==='CONSTRUCTION'?DEMO_SWAPS.map(s=>({...s})):[]));
+     setLoadedProfile(pk);setScheduleStatus(data.saved?'saved':'demo');setCmp(null);
+    })
+    .catch(()=>{if(generation!==loadGeneration.current)return;
+     setRoster(initialRoster(PROFILES[pk]));setSwaps(pk==='CONSTRUCTION'?DEMO_SWAPS.map(s=>({...s})):[]);
+     setLoadedProfile(pk);setScheduleStatus('demo');setStorageError('Could not load the shared schedule. Demo data is shown; reload the page to try again.');
+    });
+   return()=>{if(generation===loadGeneration.current)loadGeneration.current++};
+  },[pk]);
+  useEffect(()=>{
+   if(scheduleStatus!=='dirty'||loadedProfile!==pk)return;
+   const generation=saveGeneration.current;
+   const timerId=setTimeout(()=>{
+    setScheduleStatus('saving');
+    fetch('/api/state',{method:'PUT',headers:{'Content-Type':'application/json'},
+     body:JSON.stringify({profile:pk,roster,swaps})})
+     .then(res=>{if(!res.ok)throw new Error('Server returned '+res.status);return res.json()})
+     .then(()=>{if(generation===saveGeneration.current)setScheduleStatus('saved')})
+     .catch(()=>{if(generation===saveGeneration.current){
+      setScheduleStatus('error');setStorageError('Could not save changes. Your edits are still on screen; retry the save or reload after the connection returns.');
+     }});
+   },350);
+   return()=>clearTimeout(timerId);
+  },[roster,swaps,pk,scheduleStatus,loadedProfile]);
+  const retrySave=()=>{setStorageError('');setScheduleStatus('dirty')};
  useEffect(()=>()=>{clearInterval(timer.current);toastTimers.current.forEach(clearTimeout);toastTimers.current.clear()},[]);
  useEffect(()=>{if(!modal)return;const f=e=>e.key==='Escape'&&setModal(false);window.addEventListener('keydown',f);return()=>window.removeEventListener('keydown',f)},[modal]);
 
@@ -83,19 +127,19 @@ function App(){
  const toast=useCallback((text,type='info')=>{const id=Date.now()+Math.random();
   setToasts(p=>[{id,text,type},...p.slice(0,3)]);const t=setTimeout(()=>{setToasts(p=>p.filter(n=>n.id!==id));toastTimers.current.delete(t)},4500);toastTimers.current.add(t)},[]);
 
- const editShift=(w,d,v)=>{setRoster(p=>({...p,[w]:{...p[w],[d]:v}}));toast('Shift updated for '+WORKERS.find(x=>x.id===w).name+' on '+d)};
+  const editShift=(w,d,v)=>{updateRoster(p=>({...p,[w]:{...p[w],[d]:v}}));toast('Shift updated for '+WORKERS.find(x=>x.id===w).name+' on '+d)};
 
  const approve=id=>{const s=swaps.find(x=>x.id===id);if(!s||s.status!=='pending')return;
   const a=roster[s.req]?.[s.day]??'rest',b=roster[s.tgt]?.[s.day]??'rest';
-  const next={...roster,[s.req]:{...roster[s.req],[s.day]:b},[s.tgt]:{...roster[s.tgt],[s.day]:a}};
+   const next={...roster,[s.req]:{...roster[s.req],[s.day]:b},[s.tgt]:{...roster[s.tgt],[s.day]:a}};
   const bad=[s.req,s.tgt].filter(k=>analyze(next[k],P,cap,maxC).risk&&!analyze(roster[k],P,cap,maxC).risk);
-  if(bad.length){setSwaps(q=>q.map(x=>x.id===id?{...x,status:'blocked'}:x));
+   if(bad.length){updateSwaps(q=>q.map(x=>x.id===id?{...x,status:'blocked'}:x));
    toast('Swap blocked: would breach limits for '+bad.map(k=>WORKERS.find(w=>w.id===k).name).join(', '),'error');return}
-  setRoster(next);setSwaps(q=>q.map(x=>x.id===id?{...x,status:'approved'}:x));toast('Swap approved, roster updated','success')};
- const decline=id=>{setSwaps(q=>q.map(x=>x.id===id?{...x,status:'declined'}:x));toast('Swap declined')};
+   updateRoster(next);updateSwaps(q=>q.map(x=>x.id===id?{...x,status:'approved'}:x));toast('Swap approved, roster updated','success')};
+  const decline=id=>{updateSwaps(q=>q.map(x=>x.id===id?{...x,status:'declined'}:x));toast('Swap declined')};
  const sendSwap=()=>{if(!swTgt||swTgt===wid)return;
   if((roster[wid]?.[swDay]||'rest')===(roster[swTgt]?.[swDay]||'rest')){toast('Both workers have the same shift that day','error');return}
-  setSwaps(q=>[{id:'s'+Date.now(),req:wid,tgt:swTgt,day:swDay,status:'pending'},...q]);setModal(false);
+   updateSwaps(q=>[{id:'s'+Date.now(),req:wid,tgt:swTgt,day:swDay,status:'pending'},...q]);setModal(false);
   toast('Swap request sent to '+WORKERS.find(w=>w.id===swTgt).name+' for '+swDay,'success')};
  const openModal=()=>{setSwDay('Mon');setSwTgt(WORKERS.find(w=>w.id!==wid).id);setModal(true)};
 
@@ -136,7 +180,7 @@ function App(){
      const ns=statsFor(nr,P,cap,maxC),gap1=coverage(nr,P).filter(c=>c.gap).length;
      setCmp({g0,g1:gini(ns.map(s=>s.overtime)),a0,a1:ns.filter(s=>s.risk).length,gap0,gap1});
      setLogs(l=>[...l,...safetyWarnings,'Safety-officer repair + coverage check: '+gap1+' day(s) below minimum']);
-     setRoster(nr);setSwaps(q=>q.map(x=>x.status==='pending'?{...x,status:'expired'}:x));
+      updateRoster(nr);updateSwaps(q=>q.map(x=>x.status==='pending'?{...x,status:'expired'}:x));
      setLogs(l=>[...l,'Optimization complete. Roster deployed; pending swaps expired.']);toast('Fair roster generated','success');
     } catch(err) {
      setLogs(l=>[...l,'Solver error: '+(err?.message||String(err))]);toast('Roster generation failed. Review the solver trace.','error');
@@ -160,6 +204,7 @@ function App(){
  const card='bg-slate-900/60 border border-slate-800 rounded-2xl';
  const Stat=(label,icon,val,cls,sub)=>html`<div class="${card} p-5"><div class="flex justify-between text-xs uppercase tracking-wider text-slate-400"><span>${label}</span><span>${icon}</span></div><p class="text-3xl font-bold font-mono mt-2 ${cls}">${val}</p><p class="text-[11px] text-slate-500 mt-1">${sub}</p></div>`;
  const gCls=G<0.2?'text-emerald-400':G<0.35?'text-amber-400':'text-rose-400';
+  const persistenceLabel={loading:'Loading schedule…',demo:'Demo schedule',dirty:'Unsaved changes',saving:'Saving changes…',saved:'Shared saved schedule',error:'Save failed'}[scheduleStatus];
  const tabs=[['generator','Roster Generator'],['roster','Schedule Matrix'],['audit','Audit & Swaps']];
  const sliders=[['overtime','Overtime Balance','≥ 50 enables least-loaded-first'],['rest','Rest Guarantee','Drives consecutive-day cap (3–5) and daily staffing'],['pref','Shift-Type Stability','≥ 50 locks workers to a shift type']];
  const toggleBox=(icon,title,sub,val,set)=>html`<label class="flex items-center justify-between p-3 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer"><div class="flex items-center gap-2.5"><span>${icon}</span><div><p class="text-xs font-semibold text-white">${title}</p><p class="text-[10px] text-slate-400">${sub}</p></div></div><input type="checkbox" checked=${val} disabled=${running} onChange=${e=>set(e.target.checked)} class="w-4 h-4 accent-cyan-500"/></label>`;
@@ -177,7 +222,13 @@ function App(){
    <div class="flex bg-slate-950 p-1 rounded-xl border border-slate-800">${[['admin','Admin Console'],['worker','Worker App']].map(([k,l])=>html`<button key=${k} onClick=${()=>setRole(k)} class="px-3 py-1.5 text-xs font-semibold rounded-lg ${role===k?'bg-indigo-600 text-white':'text-slate-400'}">${l}</button>`)}</div>
   </div>
  </header>
- <main class="flex-1 p-5 max-w-7xl mx-auto w-full">
+  <main class="flex-1 p-5 max-w-7xl mx-auto w-full">
+  <div class="mb-5 p-3 rounded-xl border ${scheduleStatus==='error'||storageError?'border-amber-500/30 bg-amber-500/5':'border-slate-800 bg-slate-900/40'} flex flex-wrap items-center justify-between gap-2" role="status">
+   <div><p class="text-xs font-semibold ${scheduleStatus==='saved'?'text-emerald-300':scheduleStatus==='error'?'text-amber-300':'text-cyan-300'}">${persistenceLabel}</p>
+    <p class="text-[11px] text-slate-400">${scheduleStatus==='demo'?'Sample data only. Changes save to the shared schedule.':'Changes are shared with everyone using this app.'}</p>
+    ${storageError&&html`<p class="text-[11px] text-amber-300 mt-1">${storageError}</p>`}</div>
+   ${scheduleStatus==='error'&&html`<button onClick=${retrySave} class="px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs font-semibold">Retry save</button>`}
+  </div>
  ${role==='admin'?html`<div class="space-y-6 fade">
   <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
    ${Stat('Gini Coefficient','📊',G.toFixed(3),gCls,G<0.2?'Very fair (< 0.20)':G<0.35?'Moderate bias — rebalance':'High inequality')}
@@ -191,8 +242,8 @@ function App(){
    <div class="${card} p-6 space-y-5"><h2 class="font-bold text-white">🎚️ Optimization Weights</h2>
     ${sliders.map(([k,l,h])=>html`<div key=${k}><div class="flex justify-between text-xs mb-1"><span class="text-slate-300 font-medium">${l}</span><span class="font-mono text-cyan-400">${wt[k]}%</span></div><input type="range" min="0" max="100" value=${wt[k]} disabled=${running} aria-label=${l} onInput=${e=>setWt({...wt,[k]:+e.target.value})} class="w-full accent-cyan-500"/><p class="text-[10px] text-slate-500">${h}</p></div>`)}
     <div class="pt-4 border-t border-slate-800">${pk==='CONSTRUCTION'?toggleBox('☀️','Weather Delay Buffer','Lowers fatigue cap by 4h',weather,setWeather):toggleBox('⚡','Exam Period Surge','Tightens consecutive-day cap by 1',surge,setSurge)}</div>
-    <button onClick=${run} disabled=${running} class="w-full py-3 rounded-xl font-bold text-sm ${running?'bg-slate-800 text-slate-500 cursor-not-allowed':'bg-gradient-to-r from-cyan-500 to-indigo-600 text-white hover:brightness-110'}">${running?'Solving…':'⚡ Generate Fair Roster'}</button>
-    <button onClick=${loadUnfair} disabled=${running} class="w-full py-2 rounded-xl text-xs font-semibold border border-slate-700 text-slate-300 hover:bg-slate-800">🧪 Load unfair demo roster</button>
+    <button onClick=${run} disabled=${running||scheduleStatus==='loading'} class="w-full py-3 rounded-xl font-bold text-sm ${running?'bg-slate-800 text-slate-500 cursor-not-allowed':'bg-gradient-to-r from-cyan-500 to-indigo-600 text-white hover:brightness-110'}">${running?'Solving…':'⚡ Generate Fair Roster'}</button>
+    <button onClick=${loadUnfair} disabled=${running||scheduleStatus==='loading'} class="w-full py-2 rounded-xl text-xs font-semibold border border-slate-700 text-slate-300 hover:bg-slate-800">🧪 Load unfair demo roster</button>
    </div>
    <div class="lg:col-span-2 ${card} p-6 flex flex-col gap-4">${cmp&&html`<div class="fade rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-4 grid grid-cols-3 gap-3 text-center">
      ${[['Gini',cmp.g0.toFixed(3),cmp.g1.toFixed(3)],['Fatigue alerts',cmp.a0,cmp.a1],['Coverage gaps',cmp.gap0,cmp.gap1]].map(([l,a,b])=>html`<div key=${l}><p class="text-[10px] uppercase tracking-wider text-slate-400">${l}</p><p class="font-mono text-lg font-bold mt-1"><span class="text-rose-400">${a}</span> <span class="text-slate-500">→</span> <span class="text-emerald-400">${b}</span></p></div>`)}
@@ -205,7 +256,7 @@ function App(){
   ${tab==='roster'&&html`<div class="${card} p-6 space-y-4"><div><h2 class="font-bold text-white">7-Day Master Roster</h2><p class="text-xs text-slate-400">Editable — totals and fatigue flags update live.</p></div>
    <div class="overflow-x-auto"><table class="w-full text-left min-w-[760px]"><thead><tr class="border-b border-slate-800 text-xs text-slate-400"><th class="py-2 px-3">Worker</th>${DAYS.map(d=>html`<th key=${d} class="py-2 px-1 text-center">${d}</th>`)}<th class="px-3 text-center">Hours</th><th class="px-3 text-center">Status</th></tr></thead>
    <tbody class="divide-y divide-slate-800/60 text-xs">${stats.map(w=>html`<tr key=${w.id}><td class="py-2 px-3"><p class="font-semibold text-white">${w.name}</p><p class="text-[10px] text-cyan-400 font-mono">${w.skill}</p></td>
-    ${DAYS.map(d=>{const cur=roster[w.id]?.[d]||'rest';return html`<td key=${d} class="py-1.5 px-1"><select value=${cur} aria-label=${w.name+' '+d} disabled=${running} onChange=${e=>editShift(w.id,d,e.target.value)} class="w-full min-h-[44px] py-2 rounded-lg text-center text-[11px] font-semibold border ${shiftCls(P,cur)}">${P.shifts.map(s=>html`<option key=${s.id} value=${s.id} class="bg-slate-900 text-slate-200">${s.icon} ${s.name}</option>`)}</select></td>`})}
+     ${DAYS.map(d=>{const cur=roster[w.id]?.[d]||'rest';return html`<td key=${d} class="py-1.5 px-1"><select value=${cur} aria-label=${w.name+' '+d} disabled=${running||scheduleStatus==='loading'} onChange=${e=>editShift(w.id,d,e.target.value)} class="w-full min-h-[44px] py-2 rounded-lg text-center text-[11px] font-semibold border ${shiftCls(P,cur)}">${P.shifts.map(s=>html`<option key=${s.id} value=${s.id} class="bg-slate-900 text-slate-200">${s.icon} ${s.name}</option>`)}</select></td>`})}
     <td class="px-3 text-center font-mono font-bold">${w.totalHours}h</td><td class="px-3 text-center">${w.risk?html`<span class="text-[10px] bg-rose-500/10 text-rose-400 border border-rose-500/30 px-2 py-0.5 rounded-full">⚠ Risk</span>`:html`<span class="text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded-full">✓ Safe</span>`}</td></tr>`)}</tbody>
    <tfoot><tr class="border-t border-slate-700 text-[11px]"><td class="py-2 px-3 text-slate-400 font-semibold">Coverage<br/>(min ${MIN_COVER} + safety)</td>
     ${cov.map(c=>html`<td key=${c.d} class="py-2 px-1 text-center"><span title=${c.n+' working'+(c.safety?'':' · no Safety Officer')} class="inline-block px-1.5 py-0.5 rounded font-mono border ${c.gap?'bg-rose-500/15 text-rose-400 border-rose-500/30':'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'}">${c.n}${c.safety?' 🛡':' ⚠'}</span></td>`)}
@@ -229,7 +280,7 @@ function App(){
   <div class="${card} p-5 space-y-3"><span class="text-sm font-bold text-white">🎙️ Voice Helper</span>
    <div class="grid grid-cols-2 gap-2">${[['🗣️ Next shift?','When is my next shift?'],['🔄 Request swap','Request a swap']].map(([l,q])=>html`<button key=${q} onClick=${()=>voice(q)} class="p-3 rounded-xl bg-slate-950 border border-slate-800 hover:border-cyan-500/50 text-left text-xs font-semibold">${l}</button>`)}</div>
    ${(vq||vr)&&html`<div class="p-3 rounded-xl bg-slate-950 border border-slate-800 fade"><p class="text-[10px] font-mono text-slate-500">YOU: “${vq}”</p><p class="text-xs text-slate-200 mt-1">${vr}</p></div>`}</div>
-  <div class="${card} p-5 space-y-3"><div class="flex justify-between items-center"><h3 class="text-sm font-bold text-white">My 7-Day Schedule</h3><button disabled=${running} onClick=${openModal} class="px-3 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-[11px]">🔄 Request Swap</button></div>
+   <div class="${card} p-5 space-y-3"><div class="flex justify-between items-center"><h3 class="text-sm font-bold text-white">My 7-Day Schedule</h3><button disabled=${running||scheduleStatus==='loading'} onClick=${openModal} class="px-3 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-[11px]">🔄 Request Swap</button></div>
    <div class="grid grid-cols-7 gap-1.5">${DAYS.map(d=>{const id=roster[aw.id]?.[d]||'rest',s=P.shifts.find(x=>x.id===id);return html`<div key=${d} class="p-2 rounded-xl border flex flex-col items-center justify-between h-[86px] text-center ${shiftCls(P,id)}"><span class="text-[9px] font-bold text-slate-400 uppercase">${d}</span><span class="text-lg">${s?.icon||'💤'}</span><span class="text-[8px] font-semibold">${s?.hours?s.hours+'h':'Rest'}</span></div>`})}</div></div>
  </div>`}
  </main>
@@ -238,7 +289,7 @@ function App(){
    <div class="space-y-3 text-xs"><div><label class="block text-slate-400 mb-1">Shift day</label><select value=${swDay} onChange=${e=>setSwDay(e.target.value)} class="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5">${DAYS.map(d=>html`<option key=${d} value=${d}>${d} — ${roster[wid]?.[d]||'rest'}</option>`)}</select></div>
    <div><label class="block text-slate-400 mb-1">Swap with</label><select value=${swTgt} onChange=${e=>setSwTgt(e.target.value)} class="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5">${WORKERS.filter(w=>w.id!==wid).map(w=>html`<option key=${w.id} value=${w.id}>${w.name} (${w.skill})</option>`)}</select></div>
    <p class="p-3 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-cyan-300 text-[11px]">Fatigue caps are re-validated on admin approval.</p></div>
-   <div class="flex gap-3"><button onClick=${()=>setModal(false)} class="w-1/2 py-2.5 rounded-xl border border-slate-800 text-slate-400 text-xs font-semibold">Cancel</button><button disabled=${running} onClick=${sendSwap} class="w-1/2 py-2.5 rounded-xl bg-cyan-500 text-slate-950 font-bold text-xs">Submit</button></div></div></div>`}
+    <div class="flex gap-3"><button onClick=${()=>setModal(false)} class="w-1/2 py-2.5 rounded-xl border border-slate-800 text-slate-400 text-xs font-semibold">Cancel</button><button disabled=${running||scheduleStatus==='loading'} onClick=${sendSwap} class="w-1/2 py-2.5 rounded-xl bg-cyan-500 text-slate-950 font-bold text-xs">Submit</button></div></div></div>`}
  <footer class="border-t border-slate-900 px-6 py-4 text-[11px] text-slate-500 flex flex-wrap justify-between gap-3"><span>ShiftFair © 2026 — Equity & Safety Compliance Engine</span><span>Gini <strong class="text-cyan-400 font-mono">${G.toFixed(3)}</strong> · ${P.name}</span></footer>
  </div>`;
 }
